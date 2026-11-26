@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+# raw simulation output (tens of GB): regenerate with scripts/run_*.py
+results/*/*/
+results/**/*.pkl
+results/**/*.csv.gz
+# external sources, fetched separately (see README)
+/gem5/
+/benchmarks/splash4/
+/benchmarks/parsec-*/
+# LaTeX build files
+*.aux
+*.log
+*.out
+*.bbl
+*.blg

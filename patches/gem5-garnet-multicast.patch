@@ -1,0 +1,779 @@
+diff --git a/build_opts/X86_MESI_hammer b/build_opts/X86_MESI_hammer
+new file mode 100644
+index 0000000..d841538
+--- /dev/null
++++ b/build_opts/X86_MESI_hammer
+@@ -0,0 +1,8 @@
++RUBY=y
++NUMBER_BITS_PER_SET=128
++USE_MULTIPLE_PROTOCOLS=y
++PROTOCOL="MULTIPLE"
++RUBY_PROTOCOL_MESI_Two_Level=y
++RUBY_PROTOCOL_MOESI_hammer=y
++BUILD_ISA=y
++USE_X86_ISA=y
+diff --git a/configs/example/garnet_synth_traffic.py b/configs/example/garnet_synth_traffic.py
+index 8bbacd7..f2d7c03 100644
+--- a/configs/example/garnet_synth_traffic.py
++++ b/configs/example/garnet_synth_traffic.py
+@@ -82,6 +82,21 @@ parser.add_argument(
+                         for injection rate",
+ )
+ 
++parser.add_argument(
++    "--mc-prob",
++    type=float,
++    default=0.0,
++    help="Fraction of packets sent as a multicast to every other directory",
++)
++
++parser.add_argument(
++    "--burst-prob",
++    type=float,
++    default=0.0,
++    help="After injecting, inject again in the same cycle with this "
++    "probability (GGeo bursts)",
++)
++
+ parser.add_argument(
+     "--sim-cycles", type=int, default=1000, help="Number of simulation cycles"
+ )
+@@ -135,6 +150,8 @@ cpus = [
+         sim_cycles=args.sim_cycles,
+         traffic_type=args.synthetic,
+         inj_rate=args.injectionrate,
++        mc_prob=args.mc_prob,
++        burst_prob=args.burst_prob,
+         inj_vnet=args.inj_vnet,
+         precision=args.precision,
+         num_dest=args.num_dirs,
+diff --git a/configs/network/Network.py b/configs/network/Network.py
+index 9cdef67..8e50822 100644
+--- a/configs/network/Network.py
++++ b/configs/network/Network.py
+@@ -121,6 +121,22 @@ def define_options(parser):
+         help="""enable network fault model:
+             see src/mem/ruby/network/fault_model/""",
+     )
++    parser.add_argument(
++        "--garnet-trace",
++        action="store",
++        type=str,
++        default="",
++        help="write a per-message Garnet injection trace to this file "
++        "(relative to the output directory; .gz compresses)",
++    )
++    parser.add_argument(
++        "--roi-max-cycles",
++        action="store",
++        type=int,
++        default=0,
++        help="end the run this many network cycles after the workload's "
++        "ROI begin marker (0 = run to completion)",
++    )
+     parser.add_argument(
+         "--garnet-deadlock-threshold",
+         action="store",
+@@ -198,6 +214,8 @@ def init_network(options, network, InterfaceClass):
+         network.ni_flit_size = options.link_width_bits / 8
+         network.routing_algorithm = options.routing_algorithm
+         network.garnet_deadlock_threshold = options.garnet_deadlock_threshold
++        network.trace_file = options.garnet_trace
++        network.roi_max_cycles = options.roi_max_cycles
+ 
+         # Create Bridges and connect them to the corresponding links
+         for intLink in network.int_links:
+diff --git a/configs/topologies/Mesh_XY_Partial.py b/configs/topologies/Mesh_XY_Partial.py
+new file mode 100644
+index 0000000..aeed54b
+--- /dev/null
++++ b/configs/topologies/Mesh_XY_Partial.py
+@@ -0,0 +1,205 @@
++# Copyright (c) 2010 Advanced Micro Devices, Inc.
++#               2016 Georgia Institute of Technology
++# All rights reserved.
++#
++# Redistribution and use in source and binary forms, with or without
++# modification, are permitted provided that the following conditions are
++# met: redistributions of source code must retain the above copyright
++# notice, this list of conditions and the following disclaimer;
++# redistributions in binary form must reproduce the above copyright
++# notice, this list of conditions and the following disclaimer in the
++# documentation and/or other materials provided with the distribution;
++# neither the name of the copyright holders nor the names of its
++# contributors may be used to endorse or promote products derived from
++# this software without specific prior written permission.
++#
++# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
++# "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
++# LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
++# A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
++# OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
++# SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
++# LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
++# DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
++# THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
++# (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
++# OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
++
++from common import FileSystemConfig
++from topologies.BaseTopology import SimpleTopology
++
++from m5.objects import *
++from m5.params import *
++
++# Mesh_XY with the j-th controller of each type on router j, so a type may
++# have fewer controllers than routers.
++# XY routing is enforced (using link weights)
++# to guarantee deadlock freedom.
++
++
++class Mesh_XY_Partial(SimpleTopology):
++    description = "Mesh_XY_Partial"
++
++    def __init__(self, controllers):
++        self.nodes = controllers
++
++    # Makes a generic mesh
++    # assuming an equal number of cache and directory cntrls
++
++    def makeTopology(self, options, network, IntLink, ExtLink, Router):
++        nodes = self.nodes
++
++        num_routers = options.num_cpus
++        num_rows = options.mesh_rows
++
++        # default values for link latency and router latency.
++        # Can be over-ridden on a per link/router basis
++        link_latency = options.link_latency  # used by simple and garnet
++        router_latency = options.router_latency  # only used by garnet
++
++        assert num_rows > 0 and num_rows <= num_routers
++        num_columns = int(num_routers / num_rows)
++        assert num_columns * num_rows == num_routers
++
++        # Create the routers in the mesh
++        routers = [
++            Router(router_id=i, latency=router_latency)
++            for i in range(num_routers)
++        ]
++        network.routers = routers
++
++        # link counter to set unique link ids
++        link_count = 0
++
++        # The j-th controller of each type sits on router j, so a type may
++        # have fewer controllers than there are routers (e.g. 32 L2 banks
++        # and directories on a 6x6 mesh, as Ruby needs a power of two).
++        # DMA controllers go to router 0.
++        ext_links = []
++        seen = {}
++        for n in nodes:
++            if n.type == "DMA_Controller":
++                router_id = 0
++            else:
++                router_id = seen.get(n.type, 0)
++                seen[n.type] = router_id + 1
++                assert router_id < num_routers
++            ext_links.append(
++                ExtLink(
++                    link_id=link_count,
++                    ext_node=n,
++                    int_node=routers[router_id],
++                    latency=link_latency,
++                )
++            )
++            link_count += 1
++
++        network.ext_links = ext_links
++
++        # Create the mesh links.
++        int_links = []
++
++        # --per-vnet-links: create one dedicated link per vnet per direction.
++        # Default (off): one shared link per direction (supported_vnets=[]).
++        per_vnet = getattr(options, "per_vnet_links", False)
++        num_vnets = network.number_of_virtual_networks
++        vnets = list(range(num_vnets)) if per_vnet else [None]
++
++        if per_vnet:
++            print(
++                f"Mesh_XY: per_vnet_links enabled, "
++                f"{num_vnets} links per direction per router pair"
++            )
++
++        # East output to West input links (weight = 1)
++        for v in vnets:
++            for row in range(num_rows):
++                for col in range(num_columns):
++                    if col + 1 < num_columns:
++                        east_out = col + (row * num_columns)
++                        west_in = (col + 1) + (row * num_columns)
++                        int_links.append(
++                            IntLink(
++                                link_id=link_count,
++                                src_node=routers[east_out],
++                                dst_node=routers[west_in],
++                                src_outport="East",
++                                dst_inport="West",
++                                latency=link_latency,
++                                weight=1,
++                                supported_vnets=[v] if v is not None else [],
++                            )
++                        )
++                        link_count += 1
++
++        # West output to East input links (weight = 1)
++        for v in vnets:
++            for row in range(num_rows):
++                for col in range(num_columns):
++                    if col + 1 < num_columns:
++                        east_in = col + (row * num_columns)
++                        west_out = (col + 1) + (row * num_columns)
++                        int_links.append(
++                            IntLink(
++                                link_id=link_count,
++                                src_node=routers[west_out],
++                                dst_node=routers[east_in],
++                                src_outport="West",
++                                dst_inport="East",
++                                latency=link_latency,
++                                weight=1,
++                                supported_vnets=[v] if v is not None else [],
++                            )
++                        )
++                        link_count += 1
++
++        # North output to South input links (weight = 2)
++        for v in vnets:
++            for col in range(num_columns):
++                for row in range(num_rows):
++                    if row + 1 < num_rows:
++                        north_out = col + (row * num_columns)
++                        south_in = col + ((row + 1) * num_columns)
++                        int_links.append(
++                            IntLink(
++                                link_id=link_count,
++                                src_node=routers[north_out],
++                                dst_node=routers[south_in],
++                                src_outport="North",
++                                dst_inport="South",
++                                latency=link_latency,
++                                weight=2,
++                                supported_vnets=[v] if v is not None else [],
++                            )
++                        )
++                        link_count += 1
++
++        # South output to North input links (weight = 2)
++        for v in vnets:
++            for col in range(num_columns):
++                for row in range(num_rows):
++                    if row + 1 < num_rows:
++                        north_in = col + (row * num_columns)
++                        south_out = col + ((row + 1) * num_columns)
++                        int_links.append(
++                            IntLink(
++                                link_id=link_count,
++                                src_node=routers[south_out],
++                                dst_node=routers[north_in],
++                                src_outport="South",
++                                dst_inport="North",
++                                latency=link_latency,
++                                weight=2,
++                                supported_vnets=[v] if v is not None else [],
++                            )
++                        )
++                        link_count += 1
++
++        network.int_links = int_links
++
++    # Register nodes with filesystem
++    def registerTopology(self, options):
++        for i in range(options.num_cpus):
++            FileSystemConfig.register_node(
++                [i], MemorySize(options.mem_size) // options.num_cpus, i
++            )
+diff --git a/src/cpu/testers/garnet_synthetic_traffic/GarnetSyntheticTraffic.cc b/src/cpu/testers/garnet_synthetic_traffic/GarnetSyntheticTraffic.cc
+index 6fcfe04..0638eaa 100644
+--- a/src/cpu/testers/garnet_synthetic_traffic/GarnetSyntheticTraffic.cc
++++ b/src/cpu/testers/garnet_synthetic_traffic/GarnetSyntheticTraffic.cc
+@@ -65,10 +65,21 @@ GarnetSyntheticTraffic::CpuPort::recvReqRetry()
+ void
+ GarnetSyntheticTraffic::sendPkt(PacketPtr pkt)
+ {
+-    if (!cachePort.sendTimingReq(pkt)) {
+-        retryPkt = pkt; // RubyPort will retry sending
+-    }
++    // queue it, so a refused packet is never lost or holds back injection
++    pending.push_back(pkt);
+     numPacketsSent++;
++    drainPending();
++}
++
++void
++GarnetSyntheticTraffic::drainPending()
++{
++    while (!pending.empty() && retryPkt == NULL) {
++        PacketPtr pkt = pending.front();
++        pending.pop_front();
++        if (!cachePort.sendTimingReq(pkt))
++            retryPkt = pkt; // RubyPort will retry sending
++    }
+ }
+ 
+ GarnetSyntheticTraffic::GarnetSyntheticTraffic(const Params &p)
+@@ -87,6 +98,8 @@ GarnetSyntheticTraffic::GarnetSyntheticTraffic(const Params &p)
+       singleDest(p.single_dest),
+       trafficType(p.traffic_type),
+       injRate(p.inj_rate),
++      mcProb(p.mc_prob),
++      burstProb(p.burst_prob),
+       injVnet(p.inj_vnet),
+       precision(p.precision),
+       responseLimit(p.response_limit),
+@@ -168,8 +181,16 @@ GarnetSyntheticTraffic::tick()
+         if (singleSender >= 0 && id != singleSender)
+             senderEnable = false;
+ 
+-        if (senderEnable)
+-            generatePkt();
++        if (senderEnable) {
++            // GGeo: after one packet, another in the same cycle with
++            // probability burst_prob
++            int n = 1;
++            while (burstProb > 0 && n < 64 &&
++                   rng->random<double>() < burstProb)
++                n++;
++            for (int i = 0; i < n; i++)
++                generatePkt();
++        }
+     }
+ 
+     // Schedule wakeup
+@@ -242,11 +263,34 @@ GarnetSyntheticTraffic::generatePkt()
+         fatal("Unknown Traffic Type: %s!\n", traffic);
+     }
+ 
++    // A multicast goes to every directory but the one on our own router:
++    // address bit 26 flags it, and the destination bits name our router.
++    // A router without a directory (more cores than directories, e.g. 36
++    // cores and 32 directories on a 6x6 mesh) sets bit 25 too: every
++    // directory. (Ruby XORs bits 20-23 into the directory choice, so avoid
++    // those.)
++    bool multicast = mcProb > 0 && rng->random<double>() < mcProb;
++    bool mc_all = multicast && id >= num_destinations;
++    if (multicast)
++        destination = mc_all ? 0 : id;
++
+     // The source of the packets is a cache.
+     // The destination of the packets is a directory.
+     // The destination bits are embedded in the address after byte-offset.
+     Addr paddr =  destination;
+     paddr <<= blockSizeBits;
++    if (multicast)
++        paddr |= (Addr)1 << 26;
++    if (mc_all)
++        paddr |= (Addr)1 << 25;
++    // a rolling packet number in the bits between the destination and the
++    // hashed bits, so packets in flight never share a cache line (the
++    // sequencer holds back a second request to a busy line)
++    int dest_bits = (int) ceil(log2((double) num_destinations));
++    int seq_lo = blockSizeBits + dest_bits;
++    if (seq_lo < 20)
++        paddr |= ((Addr) numPacketsSent & ((1ULL << (20 - seq_lo)) - 1))
++                 << seq_lo;
+     unsigned access_size = 1; // Does not affect Ruby simulation
+ 
+     // Modeling different coherence msg types over different msg classes.
+@@ -342,6 +386,7 @@ GarnetSyntheticTraffic::doRetry()
+ {
+     if (cachePort.sendTimingReq(retryPkt)) {
+         retryPkt = NULL;
++        drainPending();
+     }
+ }
+ 
+diff --git a/src/cpu/testers/garnet_synthetic_traffic/GarnetSyntheticTraffic.hh b/src/cpu/testers/garnet_synthetic_traffic/GarnetSyntheticTraffic.hh
+index 965396c..fc4d727 100644
+--- a/src/cpu/testers/garnet_synthetic_traffic/GarnetSyntheticTraffic.hh
++++ b/src/cpu/testers/garnet_synthetic_traffic/GarnetSyntheticTraffic.hh
+@@ -29,6 +29,7 @@
+ #ifndef __CPU_GARNET_SYNTHETIC_TRAFFIC_HH__
+ #define __CPU_GARNET_SYNTHETIC_TRAFFIC_HH__
+ 
++#include <deque>
+ #include <set>
+ 
+ #include "base/random.hh"
+@@ -110,6 +111,7 @@ class GarnetSyntheticTraffic : public ClockedObject
+     };
+ 
+     PacketPtr retryPkt;
++    std::deque<PacketPtr> pending;   // generated, not yet accepted
+     unsigned size;
+     int id;
+ 
+@@ -129,6 +131,8 @@ class GarnetSyntheticTraffic : public ClockedObject
+     std::string trafficType; // string
+     TrafficType traffic; // enum from string
+     double injRate;
++    double mcProb;       // fraction of packets sent as multicasts
++    double burstProb;    // p_b: another packet in the same cycle
+     int injVnet;
+     int precision;
+ 
+@@ -145,6 +149,7 @@ class GarnetSyntheticTraffic : public ClockedObject
+     void initTrafficType();
+ 
+     void doRetry();
++    void drainPending();
+ 
+     friend class MemCompleteEvent;
+ };
+diff --git a/src/cpu/testers/garnet_synthetic_traffic/GarnetSyntheticTraffic.py b/src/cpu/testers/garnet_synthetic_traffic/GarnetSyntheticTraffic.py
+index 6b7e7b8..e470078 100644
+--- a/src/cpu/testers/garnet_synthetic_traffic/GarnetSyntheticTraffic.py
++++ b/src/cpu/testers/garnet_synthetic_traffic/GarnetSyntheticTraffic.py
+@@ -57,6 +57,12 @@ class GarnetSyntheticTraffic(ClockedObject):
+     )
+     traffic_type = Param.String("uniform_random", "Traffic type")
+     inj_rate = Param.Float(0.1, "Packet injection rate")
++    mc_prob = Param.Float(
++        0.0, "Fraction of packets sent as a multicast to every other directory"
++    )
++    burst_prob = Param.Float(
++        0.0, "After injecting, inject again in the same cycle with this probability (GGeo)"
++    )
+     inj_vnet = Param.Int(
+         -1,
+         "Vnet to inject in. \
+diff --git a/src/mem/ruby/network/garnet/GarnetNetwork.cc b/src/mem/ruby/network/garnet/GarnetNetwork.cc
+index 5792269..b0889f4 100644
+--- a/src/mem/ruby/network/garnet/GarnetNetwork.cc
++++ b/src/mem/ruby/network/garnet/GarnetNetwork.cc
+@@ -45,6 +45,7 @@
+ #include "mem/ruby/network/garnet/NetworkLink.hh"
+ #include "mem/ruby/network/garnet/Router.hh"
+ #include "mem/ruby/system/RubySystem.hh"
++#include "sim/sim_exit.hh"
+ 
+ namespace gem5
+ {
+@@ -71,6 +72,11 @@ GarnetNetwork::GarnetNetwork(const Params &p)
+     m_buffers_per_ctrl_vc = p.buffers_per_ctrl_vc;
+     m_routing_algorithm = p.routing_algorithm;
+     m_next_packet_id = 0;
++    m_trace = p.trace_file.empty() ? nullptr : simout.create(p.trace_file);
++    m_roi_max_cycles = p.roi_max_cycles;
++    m_roi_limit_scheduled = false;
++    m_eject = p.trace_file.empty() ? nullptr :
++        simout.create("eject_" + p.trace_file);
+ 
+     m_enable_fault_model = p.enable_fault_model;
+     if (m_enable_fault_model)
+@@ -121,6 +127,25 @@ GarnetNetwork::init()
+     assert(m_topology_ptr != NULL);
+     m_topology_ptr->createLinks(this);
+ 
++    if (m_trace) {
++        std::ostream &os = *m_trace->stream();
++        os << "# garnet message trace; times in network cycles\n";
++        for (int m = 0; m < (int) MachineType_NUM; m++) {
++            os << "# node " << MachineType_to_string((MachineType) m)
++               << " base="
++               << getRubySystem()->MachineType_base_number((MachineType) m)
++               << " count="
++               << getRubySystem()->MachineType_base_count((MachineType) m)
++               << "\n";
++        }
++        for (int v = 0; v < m_virtual_networks; v++) {
++            os << "# vnet " << v << " " << m_vnet_type_names[v] << "\n";
++        }
++        os << "enq_cyc,start_cyc,end_cyc,src,vnet,bytes,flits,type,ndest,"
++              "dests,pkts\n";
++        *m_eject->stream() << "pkt,cyc,ni\n";
++    }
++
+     // Initialize topology specific parameters
+     if (getNumRows() > 0) {
+         // Only for Mesh topology
+@@ -585,6 +610,23 @@ GarnetNetwork::collateStats()
+ void
+ GarnetNetwork::resetStats()
+ {
++    // Stat resets (m5_reset_stats / m5_dump_reset_stats from the workload)
++    // delimit the region of interest in the message trace.
++    if (m_trace)
++        *m_trace->stream() << "# reset_stats " << curCycle() << "\n";
++    if (m_eject)
++        *m_eject->stream() << "# reset_stats " << curCycle() << "\n";
++
++    // Bound simulation time: stop a fixed number of cycles into the ROI.
++    // Resets at cycle 0 come from simulator startup, not the workload.
++    if (m_roi_max_cycles && !m_roi_limit_scheduled && curCycle() > 0) {
++        m_roi_limit_scheduled = true;
++        Cycles end = curCycle() + Cycles(m_roi_max_cycles);
++        if (m_trace)
++            *m_trace->stream() << "# roi_limit " << end << "\n";
++        exitSimulationLoopClassic("roi cycle limit reached", 0,
++                                  clockEdge(Cycles(m_roi_max_cycles)));
++    }
+     for (int i = 0; i < m_routers.size(); i++) {
+         m_routers[i]->resetStats();
+     }
+diff --git a/src/mem/ruby/network/garnet/GarnetNetwork.hh b/src/mem/ruby/network/garnet/GarnetNetwork.hh
+index db37628..d640961 100644
+--- a/src/mem/ruby/network/garnet/GarnetNetwork.hh
++++ b/src/mem/ruby/network/garnet/GarnetNetwork.hh
+@@ -35,6 +35,7 @@
+ #include <iostream>
+ #include <vector>
+ 
++#include "base/output.hh"
+ #include "mem/ruby/network/Network.hh"
+ #include "mem/ruby/network/fault_model/FaultModel.hh"
+ #include "mem/ruby/network/garnet/CommonTypes.hh"
+@@ -157,6 +158,10 @@ class GarnetNetwork : public Network
+     void update_traffic_distribution(RouteInfo route);
+     int getNextPacketID() { return m_next_packet_id++; }
+ 
++    // Message-level injection trace (see trace_file param)
++    std::ostream *traceStream() { return m_trace ? m_trace->stream() : nullptr; }
++    std::ostream *ejectStream() { return m_eject ? m_eject->stream() : nullptr; }
++
+   protected:
+     // Configuration
+     int m_num_rows;
+@@ -214,6 +219,10 @@ class GarnetNetwork : public Network
+     std::vector<CreditLink *> m_creditlinks; // All credit links in the network
+     std::vector<NetworkInterface *> m_nis;   // All NI's in Network
+     int m_next_packet_id; // static vairable for packet id allocation
++    OutputStream *m_trace;
++    uint64_t m_roi_max_cycles;
++    bool m_roi_limit_scheduled;
++    OutputStream *m_eject; // per-packet delivery log, "eject_" + trace_file
+ };
+ 
+ inline std::ostream&
+diff --git a/src/mem/ruby/network/garnet/GarnetNetwork.py b/src/mem/ruby/network/garnet/GarnetNetwork.py
+index b735260..1053a2b 100644
+--- a/src/mem/ruby/network/garnet/GarnetNetwork.py
++++ b/src/mem/ruby/network/garnet/GarnetNetwork.py
+@@ -48,6 +48,17 @@ class GarnetNetwork(RubyNetwork):
+     buffers_per_ctrl_vc = Param.UInt32(1, "buffers per ctrl virtual channel")
+     routing_algorithm = Param.Int(0, "0: Weight-based Table, 1: XY, 2: Custom")
+     enable_fault_model = Param.Bool(False, "enable network fault model")
++    roi_max_cycles = Param.UInt64(
++        0,
++        "if non-zero, end the simulation this many network cycles after "
++        "the first in-run stat reset (the workload's ROI begin marker)",
++    )
++    trace_file = Param.String(
++        "",
++        "if non-empty, write a per-message injection trace (with full "
++        "destination set, before multicast splitting) to this file in the "
++        "output directory; a .gz suffix compresses it",
++    )
+     fault_model = Param.FaultModel(NULL, "network fault model")
+     garnet_deadlock_threshold = Param.UInt32(
+         50000, "network-level deadlock threshold"
+diff --git a/src/mem/ruby/network/garnet/NetworkInterface.cc b/src/mem/ruby/network/garnet/NetworkInterface.cc
+index bbf8061..9f08a31 100644
+--- a/src/mem/ruby/network/garnet/NetworkInterface.cc
++++ b/src/mem/ruby/network/garnet/NetworkInterface.cc
+@@ -34,6 +34,7 @@
+ 
+ #include <cassert>
+ #include <cmath>
++#include <sstream>
+ 
+ #include "base/cast.hh"
+ #include "debug/RubyNetwork.hh"
+@@ -60,6 +61,7 @@ NetworkInterface::NetworkInterface(const Params &p)
+     vc_busy_counter(m_virtual_networks, 0)
+ {
+     m_stall_count.resize(m_virtual_networks);
++    m_pending_trace.resize(m_virtual_networks);
+     niOutVcs.resize(0);
+ }
+ 
+@@ -256,6 +258,7 @@ NetworkInterface::wakeup()
+                     iPort->sendCredit(cFlit);
+                     // Update stats and delete flit pointer
+                     incrementStats(t_flit);
++                    traceEject(t_flit);
+                     delete t_flit;
+                 } else {
+                     // No space available- Place tail flit in stall queue and
+@@ -347,6 +350,7 @@ NetworkInterface::checkStallQueue()
+ 
+                     // Update Stats
+                     incrementStats(stallFlit);
++                    traceEject(stallFlit);
+ 
+                     // Flit can now safely be deleted and removed from stall
+                     // queue
+@@ -379,6 +383,16 @@ NetworkInterface::flitisizeMessage(MsgPtr msg_ptr, int vnet)
+     // gets all the destinations associated with this message.
+     std::vector<NodeID> dest_nodes = net_msg_dest.getAllDest();
+ 
++    if (m_net_ptr->traceStream()) {
++        PendingTrace &pt = m_pending_trace[vnet];
++        if (pt.msg != net_msg_ptr) {
++            pt.msg = net_msg_ptr;
++            pt.start = curCycle();
++            pt.dests = dest_nodes;
++            pt.pkts.clear();
++        }
++    }
++
+     // Number of flits is dependent on the link bandwidth available.
+     // This is expressed in terms of bytes/cycle or the flit size
+     OutputPort *oPort = getOutportForVnet(vnet);
+@@ -446,6 +460,8 @@ NetworkInterface::flitisizeMessage(MsgPtr msg_ptr, int vnet)
+         m_net_ptr->increment_injected_packets(vnet);
+         m_net_ptr->update_traffic_distribution(route);
+         int packet_id = m_net_ptr->getNextPacketID();
++        if (m_net_ptr->traceStream())
++            m_pending_trace[vnet].pkts.push_back(packet_id);
+         for (int i = 0; i < num_flits; i++) {
+             m_net_ptr->increment_injected_flits(vnet);
+             flit *fl = new flit(packet_id,
+@@ -461,9 +477,53 @@ NetworkInterface::flitisizeMessage(MsgPtr msg_ptr, int vnet)
+         m_ni_out_vcs_enqueue_time[vc] = curTick();
+         outVcState[vc].setState(ACTIVE_, curTick());
+     }
++    if (m_net_ptr->traceStream())
++        traceMessage(msg_ptr, vnet, num_flits);
+     return true ;
+ }
+ 
++void
++NetworkInterface::traceMessage(const MsgPtr &msg_ptr, int vnet, int num_flits)
++{
++    PendingTrace &pt = m_pending_trace[vnet];
++    std::ostream &os = *m_net_ptr->traceStream();
++
++    // Pull the protocol message type ("Type = GETS") out of the SLICC
++    // generated print(); fall back to the message class name.
++    std::ostringstream ss;
++    msg_ptr->print(ss);
++    std::string desc = ss.str();
++    std::string type;
++    size_t pos = desc.find("Type = ");
++    if (pos != std::string::npos) {
++        pos += 7;
++        size_t end = desc.find_first_of(" ,]", pos);
++        type = desc.substr(pos, end - pos);
++    } else {
++        type = desc.substr(1, desc.find(':') - 1);
++    }
++
++    os << ticksToCycles(msg_ptr->getTime()) << ',' << pt.start << ','
++       << curCycle() << ',' << m_id << ',' << vnet << ','
++       << m_net_ptr->MessageSizeType_to_int(msg_ptr->getMessageSize())
++       << ',' << num_flits << ',' << type << ',' << pt.dests.size() << ',';
++    for (size_t i = 0; i < pt.dests.size(); i++)
++        os << (i ? ";" : "") << pt.dests[i];
++    os << ',';
++    for (size_t i = 0; i < pt.pkts.size(); i++)
++        os << (i ? ";" : "") << pt.pkts[i];
++    os << '\n';
++    pt.msg = nullptr;
++}
++
++void
++NetworkInterface::traceEject(flit *t_flit)
++{
++    if (std::ostream *os = m_net_ptr->ejectStream())
++        *os << t_flit->getPacketID() << ',' << curCycle() << ',' << m_id
++            << '\n';
++}
++
+ // Looking for a free output vc
+ int
+ NetworkInterface::calculateVC(int vnet)
+diff --git a/src/mem/ruby/network/garnet/NetworkInterface.hh b/src/mem/ruby/network/garnet/NetworkInterface.hh
+index cd7bb3b..a96d07b 100644
+--- a/src/mem/ruby/network/garnet/NetworkInterface.hh
++++ b/src/mem/ruby/network/garnet/NetworkInterface.hh
+@@ -293,6 +293,20 @@ class NetworkInterface : public ClockedObject, public Consumer
+     // When a vc stays busy for a long time, it indicates a deadlock
+     std::vector<int> vc_busy_counter;
+ 
++    // Per-vnet bookkeeping for the message trace. A multicast message may
++    // need several cycles to acquire a VC for every destination, so the
++    // original destination set is captured on the first attempt.
++    struct PendingTrace
++    {
++        const Message *msg = nullptr;
++        Cycles start;
++        std::vector<NodeID> dests;
++        std::vector<int> pkts; // packet id of each copy, in dests order
++    };
++    std::vector<PendingTrace> m_pending_trace;
++    void traceMessage(const MsgPtr &msg_ptr, int vnet, int num_flits);
++    void traceEject(flit *t_flit);
++
+     void checkStallQueue();
+     bool flitisizeMessage(MsgPtr msg_ptr, int vnet);
+     int calculateVC(int vnet);
+diff --git a/src/mem/ruby/protocol/Garnet_standalone-cache.sm b/src/mem/ruby/protocol/Garnet_standalone-cache.sm
+index 5134fbd..732f1e4 100644
+--- a/src/mem/ruby/protocol/Garnet_standalone-cache.sm
++++ b/src/mem/ruby/protocol/Garnet_standalone-cache.sm
+@@ -145,7 +145,16 @@ machine(MachineType:L1Cache, "Garnet_standalone L1 Cache")
+       out_msg.addr := address;
+       out_msg.Type := CoherenceRequestType:MSG;
+       out_msg.Requestor := machineID;
+-      out_msg.Destination.add(mapAddressToMachine(address, MachineType:Directory));
++      // address bit 26 set: a multicast to every directory but our own (bit 25: all)
++      if (addressToInt(bitSelect(address, 26, 26)) != 0) {
++        out_msg.Destination.broadcast(MachineType:Directory);
++        // bit 25: our router has no directory, so keep them all
++        if (addressToInt(bitSelect(address, 25, 25)) == 0) {
++          out_msg.Destination.remove(mapAddressToMachine(address, MachineType:Directory));
++        }
++      } else {
++        out_msg.Destination.add(mapAddressToMachine(address, MachineType:Directory));
++      }
+ 
+       // To send broadcasts in vnet0 (to emulate broadcast-based protocols),
+       // replace the above line by the following:
+@@ -160,7 +169,16 @@ machine(MachineType:L1Cache, "Garnet_standalone L1 Cache")
+       out_msg.addr := address;
+       out_msg.Type := CoherenceRequestType:MSG;
+       out_msg.Requestor := machineID;
+-      out_msg.Destination.add(mapAddressToMachine(address, MachineType:Directory));
++      // address bit 26 set: a multicast to every directory but our own (bit 25: all)
++      if (addressToInt(bitSelect(address, 26, 26)) != 0) {
++        out_msg.Destination.broadcast(MachineType:Directory);
++        // bit 25: our router has no directory, so keep them all
++        if (addressToInt(bitSelect(address, 25, 25)) == 0) {
++          out_msg.Destination.remove(mapAddressToMachine(address, MachineType:Directory));
++        }
++      } else {
++        out_msg.Destination.add(mapAddressToMachine(address, MachineType:Directory));
++      }
+       out_msg.MessageSize := MessageSizeType:Control;
+     }
+   }
+@@ -170,7 +188,16 @@ machine(MachineType:L1Cache, "Garnet_standalone L1 Cache")
+       out_msg.addr := address;
+       out_msg.Type := CoherenceRequestType:MSG;
+       out_msg.Requestor := machineID;
+-      out_msg.Destination.add(mapAddressToMachine(address, MachineType:Directory));
++      // address bit 26 set: a multicast to every directory but our own (bit 25: all)
++      if (addressToInt(bitSelect(address, 26, 26)) != 0) {
++        out_msg.Destination.broadcast(MachineType:Directory);
++        // bit 25: our router has no directory, so keep them all
++        if (addressToInt(bitSelect(address, 25, 25)) == 0) {
++          out_msg.Destination.remove(mapAddressToMachine(address, MachineType:Directory));
++        }
++      } else {
++        out_msg.Destination.add(mapAddressToMachine(address, MachineType:Directory));
++      }
+       out_msg.MessageSize := MessageSizeType:Data;
+     }
+   }
